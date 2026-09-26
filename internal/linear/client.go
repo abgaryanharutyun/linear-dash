@@ -70,8 +70,19 @@ type response struct {
 	} `json:"errors"`
 }
 
-// do runs one GraphQL operation and decodes its data into out, retrying transient failures.
-func (c *Client) do(ctx context.Context, operation string, query string, variables map[string]any, out any) error {
+// query runs a read, retrying rate limits, server errors and network failures.
+func (c *Client) query(ctx context.Context, operation string, query string, variables map[string]any, out any) error {
+	return c.do(ctx, operation, query, variables, out, retryable)
+}
+
+// mutate runs a write, retrying only rate limits: after a timeout or 5xx the write may already have landed,
+// and retrying would post a comment twice.
+func (c *Client) mutate(ctx context.Context, operation string, query string, variables map[string]any, out any) error {
+	return c.do(ctx, operation, query, variables, out, rateLimited)
+}
+
+// do runs one GraphQL operation and decodes its data into out, retrying failures shouldRetry accepts.
+func (c *Client) do(ctx context.Context, operation string, query string, variables map[string]any, out any, shouldRetry func(error) bool) error {
 	body, err := json.Marshal(request{Query: query, Variables: variables})
 	if err != nil {
 		return fmt.Errorf("linear %s: encode request: %w", operation, err)
@@ -86,7 +97,7 @@ func (c *Client) do(ctx context.Context, operation string, query string, variabl
 			}
 			return nil
 		}
-		if !retryable(err) {
+		if !shouldRetry(err) {
 			return err
 		}
 		lastErr = err
@@ -139,6 +150,19 @@ func (c *Client) post(ctx context.Context, operation string, body []byte) (json.
 		return nil, &GraphQLError{Operation: operation, Messages: messages, Codes: codes}
 	}
 	return parsed.Data, nil
+}
+
+// rateLimited reports whether Linear refused the request for rate limiting, so it wasn't processed.
+func rateLimited(err error) bool {
+	var gqlErr *GraphQLError
+	if errors.As(err, &gqlErr) {
+		return slices.Contains(gqlErr.Codes, "RATELIMITED")
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Status == http.StatusTooManyRequests || strings.Contains(httpErr.Body, "RATELIMITED")
+	}
+	return false
 }
 
 // retryable reports whether a failure is worth another attempt: rate limits, server errors and network errors.

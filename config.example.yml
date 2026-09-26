@@ -1,10 +1,25 @@
 # Copy to ~/.config/linear-dash/config.yml
-# Each section's `filter` is a Linear IssueFilter, sent to the API as-is:
+# Issue sections take a `filter`: a Linear IssueFilter, sent to the API as-is:
 # https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference/inputs/IssueFilter
 
 limit: 50 # issues per section (1-250)
+refreshMinutes: 5 # reload every section this often; 0 turns it off
 
+# Where `B` checks out an issue's branch: Linear team key -> local clone
+repoPaths:
+  # ENG: ~/src/github.com/acme/api
+
+# Any section can set `grouped: true` to open grouped (by state, or by pipeline for releases).
 sections:
+  - title: Inbox
+    kind: notifications
+
+  # planned + in-progress releases and ones completed in the last recentDays; enter opens a release's issues
+  - title: Releases
+    kind: releases
+    recentDays: 30
+    grouped: true # open grouped by pipeline (t toggles)
+
   - title: My issues
     filter:
       assignee: { isMe: { eq: true } }

@@ -3,8 +3,9 @@ package linear
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"log/slog"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -28,6 +29,22 @@ type State struct {
 	Position float64 `json:"position"`
 }
 
+type Label struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
+// PullRequestLink is a GitHub PR attached to an issue, as Linear's GitHub integration reports it.
+type PullRequestLink struct {
+	URL    string
+	Title  string
+	Number int
+	Repo   string
+	// Status is Linear's PR status, e.g. draft, open, inReview, approved, merged, closed
+	Status string
+}
+
 type Issue struct {
 	ID            string
 	Identifier    string
@@ -35,12 +52,17 @@ type Issue struct {
 	Description   string
 	URL           string
 	BranchName    string
+	Priority      int
 	PriorityLabel string
-	UpdatedAt     time.Time
-	State         State
-	Assignee      *User
-	Team          Team
-	Labels        []string
+	// Estimate is nil when the issue has no estimate
+	Estimate  *float64
+	UpdatedAt time.Time
+	State     State
+	Assignee  *User
+	Team      Team
+	Labels    []Label
+	// PullRequests are the linked GitHub PRs, ones needing attention first
+	PullRequests []PullRequestLink
 }
 
 // issueNode mirrors the GraphQL shape; Issue flattens its connections.
@@ -51,46 +73,108 @@ type issueNode struct {
 	Description   string    `json:"description"`
 	URL           string    `json:"url"`
 	BranchName    string    `json:"branchName"`
+	Priority      float64   `json:"priority"`
 	PriorityLabel string    `json:"priorityLabel"`
+	Estimate      *float64  `json:"estimate"`
 	UpdatedAt     time.Time `json:"updatedAt"`
 	State         State     `json:"state"`
 	Assignee      *User     `json:"assignee"`
 	Team          Team      `json:"team"`
 	Labels        struct {
-		Nodes []struct {
-			Name string `json:"name"`
-		} `json:"nodes"`
+		Nodes []Label `json:"nodes"`
 	} `json:"labels"`
+	Attachments struct {
+		Nodes []attachmentNode `json:"nodes"`
+	} `json:"attachments"`
+}
+
+type attachmentNode struct {
+	URL        string          `json:"url"`
+	Title      string          `json:"title"`
+	SourceType string          `json:"sourceType"`
+	Metadata   json.RawMessage `json:"metadata"`
+}
+
+// prMetadata is the part of a GitHub attachment's metadata we read.
+type prMetadata struct {
+	Number   int    `json:"number"`
+	RepoName string `json:"repoName"`
+	Status   string `json:"status"`
+	Draft    bool   `json:"draft"`
+}
+
+// prStatusRank puts PRs that still need attention before finished ones; unknown statuses sort in between.
+var prStatusRank = map[string]int{
+	"changesRequested": 0,
+	"inReview":         1,
+	"open":             2,
+	"approved":         3,
+	"draft":            4,
+	"merged":           6,
+	"closed":           7,
+}
+
+// unrankedPRStatus sits between active and finished PRs.
+const unrankedPRStatus = 5
+
+func rankPRStatus(status string) int {
+	if rank, ok := prStatusRank[status]; ok {
+		return rank
+	}
+	return unrankedPRStatus
+}
+
+// pullRequests keeps GitHub PR attachments, most relevant first; metadata that doesn't parse still yields the link.
+func pullRequests(nodes []attachmentNode) []PullRequestLink {
+	prs := make([]PullRequestLink, 0, len(nodes))
+	for _, a := range nodes {
+		if a.SourceType != "github" || !strings.Contains(a.URL, "/pull/") {
+			continue
+		}
+		var meta prMetadata
+		if len(a.Metadata) > 0 {
+			if err := json.Unmarshal(a.Metadata, &meta); err != nil {
+				slog.Warn("unreadable GitHub attachment metadata", "url", a.URL, "error", err)
+			}
+		}
+		status := meta.Status
+		if meta.Draft {
+			status = "draft"
+		}
+		prs = append(prs, PullRequestLink{URL: a.URL, Title: clean(a.Title), Number: meta.Number, Repo: clean(meta.RepoName), Status: status})
+	}
+	sort.SliceStable(prs, func(i, j int) bool { return rankPRStatus(prs[i].Status) < rankPRStatus(prs[j].Status) })
+	return prs
 }
 
 func (n issueNode) toIssue() Issue {
-	labels := make([]string, 0, len(n.Labels.Nodes))
-	for _, l := range n.Labels.Nodes {
-		labels = append(labels, l.Name)
-	}
 	return Issue{
 		ID:            n.ID,
 		Identifier:    n.Identifier,
-		Title:         n.Title,
-		Description:   n.Description,
+		Title:         clean(n.Title),
+		Description:   clean(n.Description),
 		URL:           n.URL,
 		BranchName:    n.BranchName,
+		Priority:      int(n.Priority),
 		PriorityLabel: n.PriorityLabel,
+		Estimate:      n.Estimate,
 		UpdatedAt:     n.UpdatedAt,
-		State:         n.State,
-		Assignee:      n.Assignee,
-		Team:          n.Team,
-		Labels:        labels,
+		State:         cleanState(n.State),
+		Assignee:      cleanUser(n.Assignee),
+		Team:          Team{ID: n.Team.ID, Key: clean(n.Team.Key), Name: clean(n.Team.Name)},
+		Labels:        cleanLabels(n.Labels.Nodes),
+		PullRequests:  pullRequests(n.Attachments.Nodes),
 	}
 }
 
 const issueFields = `
 fragment IssueFields on Issue {
-  id identifier title description url branchName priorityLabel updatedAt
+  id identifier title description url branchName priority priorityLabel estimate updatedAt
   state { id name type color position }
   assignee { id name displayName }
   team { id key name }
-  labels(first: 20) { nodes { name } }
+  labels(first: 20) { nodes { id name color } }
+  attachments(first: 10) { nodes { url title sourceType metadata } }
 }`
 
 // Issues returns up to first issues matching a Linear IssueFilter, most recently updated first.
@@ -104,7 +188,7 @@ func (c *Client) Issues(ctx context.Context, filter json.RawMessage, first int) 
 			Nodes []issueNode `json:"nodes"`
 		} `json:"issues"`
 	}
-	if err := c.do(ctx, "issues", query, map[string]any{"filter": filter, "first": first}, &data); err != nil {
+	if err := c.query(ctx, "issues", query, map[string]any{"filter": filter, "first": first}, &data); err != nil {
 		return nil, err
 	}
 	issues := make([]Issue, 0, len(data.Issues.Nodes))
@@ -120,74 +204,8 @@ func (c *Client) Viewer(ctx context.Context) (User, error) {
 	var data struct {
 		Viewer User `json:"viewer"`
 	}
-	if err := c.do(ctx, "viewer", query, map[string]any{}, &data); err != nil {
+	if err := c.query(ctx, "viewer", query, map[string]any{}, &data); err != nil {
 		return User{}, err
 	}
 	return data.Viewer, nil
-}
-
-// TeamStates returns a team's workflow states in board order (by type, then position).
-func (c *Client) TeamStates(ctx context.Context, teamID string) ([]State, error) {
-	const query = `query TeamStates($id: String!) {
-  team(id: $id) { states { nodes { id name type color position } } }
-}`
-	var data struct {
-		Team struct {
-			States struct {
-				Nodes []State `json:"nodes"`
-			} `json:"states"`
-		} `json:"team"`
-	}
-	if err := c.do(ctx, "teamStates", query, map[string]any{"id": teamID}, &data); err != nil {
-		return nil, err
-	}
-	states := append([]State(nil), data.Team.States.Nodes...)
-	sort.SliceStable(states, func(i, j int) bool {
-		if stateTypeOrder[states[i].Type] != stateTypeOrder[states[j].Type] {
-			return stateTypeOrder[states[i].Type] < stateTypeOrder[states[j].Type]
-		}
-		return states[i].Position < states[j].Position
-	})
-	return states, nil
-}
-
-// stateTypeOrder is the column order Linear uses on its boards.
-var stateTypeOrder = map[string]int{
-	"triage":    0,
-	"backlog":   1,
-	"unstarted": 2,
-	"started":   3,
-	"completed": 4,
-	"canceled":  5,
-	"duplicate": 6,
-}
-
-// SetState moves an issue to a workflow state and returns the updated issue.
-func (c *Client) SetState(ctx context.Context, issueID string, stateID string) (Issue, error) {
-	return c.updateIssue(ctx, "setState", issueID, map[string]any{"stateId": stateID})
-}
-
-// Assign sets an issue's assignee and returns the updated issue.
-func (c *Client) Assign(ctx context.Context, issueID string, userID string) (Issue, error) {
-	return c.updateIssue(ctx, "assign", issueID, map[string]any{"assigneeId": userID})
-}
-
-func (c *Client) updateIssue(ctx context.Context, operation string, issueID string, input map[string]any) (Issue, error) {
-	const query = `mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
-  issueUpdate(id: $id, input: $input) { success issue { ...IssueFields } }
-}` + issueFields
-
-	var data struct {
-		IssueUpdate struct {
-			Success bool      `json:"success"`
-			Issue   issueNode `json:"issue"`
-		} `json:"issueUpdate"`
-	}
-	if err := c.do(ctx, operation, query, map[string]any{"id": issueID, "input": input}, &data); err != nil {
-		return Issue{}, err
-	}
-	if !data.IssueUpdate.Success {
-		return Issue{}, fmt.Errorf("linear %s: issueUpdate returned success=false for issue %s, input=%v", operation, issueID, input)
-	}
-	return data.IssueUpdate.Issue.toIssue(), nil
 }
